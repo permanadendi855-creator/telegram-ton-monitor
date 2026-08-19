@@ -2,14 +2,15 @@ import os
 import asyncio
 import time
 import logging
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any
 
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
+from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -18,79 +19,290 @@ from telegram.ext import (
     ContextTypes,
 )
 
-WALLET_ADDRESS = "UQDSmBRtE-828x5LmsWN7r-aIpfjYEJzCBI2OIiyNunwACT5"
-USDT_JETTON_MASTER = "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs"
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+WALLET_ADDRESS = (
+    "UQDSmBRtE-828x5LmsWN7r-aIpfjYEJzCBI2OIiyNunwACT5"
+)
+
+USDT_JETTON_MASTER = (
+    "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs"
+)
 
 TONCENTER_BASE = os.getenv(
     "TONCENTER_BASE",
     "https://toncenter.com/api/v3",
-).rstrip("/")
+).strip().rstrip("/")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TONCENTER_API_KEY = os.getenv("TONCENTER_API_KEY", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN",
+    "",
+).strip()
 
-POLL_SECONDS = max(10, int(os.getenv("POLL_SECONDS", "20")))
-TIMEZONE_NAME = os.getenv("TIMEZONE", "Asia/Jakarta")
-LOCAL_TZ = ZoneInfo(TIMEZONE_NAME)
+TONCENTER_API_KEY = os.getenv(
+    "TONCENTER_API_KEY",
+    "",
+).strip()
+
+
+def safe_int_env(
+    name: str,
+    default: int,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    """
+    Ambil integer dari environment variable tanpa membuat
+    aplikasi crash kalau value-nya salah.
+    """
+    raw = os.getenv(name, "").strip()
+
+    if not raw:
+        value = default
+    else:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logging.warning(
+                "%s=%r tidak valid. Menggunakan default=%s",
+                name,
+                raw,
+                default,
+            )
+            value = default
+
+    if minimum is not None:
+        value = max(minimum, value)
+
+    if maximum is not None:
+        value = min(maximum, value)
+
+    return value
+
+
+POLL_SECONDS = safe_int_env(
+    "POLL_SECONDS",
+    20,
+    minimum=10,
+    maximum=3600,
+)
+
+
+TIMEZONE_NAME = os.getenv(
+    "TIMEZONE",
+    "Asia/Jakarta",
+).strip() or "Asia/Jakarta"
+
+
+try:
+    LOCAL_TZ = ZoneInfo(TIMEZONE_NAME)
+except ZoneInfoNotFoundError:
+    logging.warning(
+        "TIMEZONE %r tidak ditemukan. "
+        "Menggunakan Asia/Jakarta.",
+        TIMEZONE_NAME,
+    )
+    TIMEZONE_NAME = "Asia/Jakarta"
+    LOCAL_TZ = ZoneInfo("Asia/Jakarta")
+
 
 AUTO_MONITOR_CHAT_IDS = {
     x.strip()
-    for x in os.getenv("AUTO_MONITOR_CHAT_IDS", "").split(",")
+    for x in os.getenv(
+        "AUTO_MONITOR_CHAT_IDS",
+        "",
+    ).split(",")
     if x.strip()
 }
 
+
+# ============================================================
+# LOGGING
+# ============================================================
+
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(name)s | "
+        "%(message)s"
+    ),
     level=logging.INFO,
 )
-logger = logging.getLogger("telegram-ton-monitor")
 
-monitor_chats: set[str] = set(AUTO_MONITOR_CHAT_IDS)
+logger = logging.getLogger(
+    "telegram-ton-monitor"
+)
+
+
+# ============================================================
+# GLOBAL STATE
+# ============================================================
+
+monitor_chats: set[str] = set(
+    AUTO_MONITOR_CHAT_IDS
+)
+
 seen_event_ids: set[str] = set()
+
 baseline_ready = False
+
 http_client: httpx.AsyncClient | None = None
 
+monitor_task: asyncio.Task | None = None
 
-def format_decimal(value: Decimal, max_places: int = 8) -> str:
-    q = value.quantize(Decimal("1." + "0" * max_places))
-    text = format(q, "f").rstrip("0").rstrip(".")
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def safe_int(
+    value: Any,
+    default: int = 0,
+) -> int:
+    try:
+        if value is None or value == "":
+            return default
+
+        return int(value)
+
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def format_decimal(
+    value: Decimal,
+    max_places: int = 8,
+) -> str:
+    if max_places < 0:
+        max_places = 0
+
+    quantizer = Decimal(
+        "1." + ("0" * max_places)
+    )
+
+    try:
+        q = value.quantize(
+            quantizer,
+            rounding=ROUND_DOWN,
+        )
+    except InvalidOperation:
+        return "0"
+
+    text = format(q, "f")
+
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+
     return text if text else "0"
 
 
-def format_amount(raw: str | int | None, decimals: int) -> str:
+def format_amount(
+    raw: str | int | float | Decimal | None,
+    decimals: int,
+) -> str:
     try:
-        value = Decimal(str(raw or "0")) / (Decimal(10) ** decimals)
-        return format_decimal(value, min(decimals, 8))
-    except (InvalidOperation, ValueError):
-        return str(raw or "0")
+        decimals = max(
+            0,
+            min(int(decimals), 30),
+        )
+
+        value = Decimal(
+            str(raw if raw is not None else "0")
+        ) / (
+            Decimal(10) ** decimals
+        )
+
+        return format_decimal(
+            value,
+            min(decimals, 8),
+        )
+
+    except (
+        InvalidOperation,
+        ValueError,
+        TypeError,
+        OverflowError,
+    ):
+        return str(
+            raw if raw is not None else "0"
+        )
 
 
-def format_ton(raw: str | int | None) -> str:
-    return format_amount(raw, 9)
+def format_ton(
+    raw: str | int | float | Decimal | None,
+) -> str:
+    return format_amount(
+        raw,
+        9,
+    )
 
 
-def fmt_time(timestamp: int | float | None) -> str:
-    if not timestamp:
+def fmt_time(
+    timestamp: int | float | None,
+) -> str:
+    timestamp_int = safe_int(
+        timestamp,
+        0,
+    )
+
+    if timestamp_int <= 0:
         return "-"
-    dt = datetime.fromtimestamp(
-        int(timestamp),
-        tz=timezone.utc,
-    ).astimezone(LOCAL_TZ)
-    return dt.strftime("%d/%m/%Y %H:%M:%S")
+
+    try:
+        dt = datetime.fromtimestamp(
+            timestamp_int,
+            tz=timezone.utc,
+        ).astimezone(LOCAL_TZ)
+
+        return dt.strftime(
+            "%d/%m/%Y %H:%M:%S"
+        )
+
+    except (
+        ValueError,
+        OverflowError,
+        OSError,
+    ):
+        return "-"
 
 
-def html_escape(text: Any) -> str:
+def html_escape(
+    text: Any,
+) -> str:
     return (
         str(text)
         .replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
+        .replace('"', "&quot;")
     )
 
 
-def explorer_url(value: str) -> str:
-    return f"https://tonviewer.com/{value}"
+def explorer_url(
+    value: str,
+) -> str:
+    return (
+        "https://tonviewer.com/"
+        + str(value).strip()
+    )
 
+
+def is_dict(
+    value: Any,
+) -> bool:
+    return isinstance(
+        value,
+        dict,
+    )
+
+
+# ============================================================
+# TELEGRAM KEYBOARDS
+# ============================================================
 
 def menu_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -142,8 +354,14 @@ def back_markup() -> InlineKeyboardMarkup:
     )
 
 
-def monitor_markup(chat_id: str) -> InlineKeyboardMarkup:
-    status = "🟢 ON" if chat_id in monitor_chats else "⚪ OFF"
+def monitor_markup(
+    chat_id: str,
+) -> InlineKeyboardMarkup:
+    status = (
+        "🟢 ON"
+        if chat_id in monitor_chats
+        else "⚪ OFF"
+    )
 
     return InlineKeyboardMarkup(
         [
@@ -163,34 +381,133 @@ def monitor_markup(chat_id: str) -> InlineKeyboardMarkup:
     )
 
 
+# ============================================================
+# TONCENTER API
+# ============================================================
+
 async def api_get(
     path: str,
     params: dict[str, Any] | None = None,
+    retries: int = 3,
 ) -> dict[str, Any]:
     global http_client
 
     if http_client is None:
-        raise RuntimeError("HTTP client belum siap")
+        raise RuntimeError(
+            "HTTP client belum siap."
+        )
 
-    headers: dict[str, str] = {}
-
-    if TONCENTER_API_KEY:
-        headers["X-API-Key"] = TONCENTER_API_KEY
-
-    response = await http_client.get(
-        f"{TONCENTER_BASE}/{path.lstrip('/')}",
-        params=params or {},
-        headers=headers,
+    url = (
+        f"{TONCENTER_BASE}/"
+        f"{path.lstrip('/')}"
     )
 
-    response.raise_for_status()
+    headers: dict[str, str] = {
+        "Accept": "application/json",
+        "User-Agent": (
+            "telegram-ton-monitor/1.0"
+        ),
+    }
 
-    data = response.json()
+    if TONCENTER_API_KEY:
+        headers["X-API-Key"] = (
+            TONCENTER_API_KEY
+        )
 
-    if isinstance(data, dict) and data.get("error"):
-        raise RuntimeError(str(data["error"]))
+    last_error: Exception | None = None
 
-    return data
+    for attempt in range(
+        max(1, retries)
+    ):
+        try:
+            response = await http_client.get(
+                url,
+                params=params or {},
+                headers=headers,
+            )
+
+            response.raise_for_status()
+
+            try:
+                data = response.json()
+            except ValueError as exc:
+                raise RuntimeError(
+                    "TON Center mengembalikan "
+                    "response JSON tidak valid."
+                ) from exc
+
+            if not isinstance(data, dict):
+                raise RuntimeError(
+                    "Format response TON Center "
+                    "tidak sesuai."
+                )
+
+            if data.get("error"):
+                raise RuntimeError(
+                    str(data.get("error"))
+                )
+
+            if data.get("errors"):
+                raise RuntimeError(
+                    str(data.get("errors"))
+                )
+
+            return data
+
+        except (
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+            httpx.HTTPStatusError,
+        ) as exc:
+            last_error = exc
+
+            status_code = (
+                exc.response.status_code
+                if isinstance(
+                    exc,
+                    httpx.HTTPStatusError,
+                )
+                and exc.response is not None
+                else None
+            )
+
+            logger.warning(
+                "API request gagal "
+                "(attempt %s/%s, status=%s): %s",
+                attempt + 1,
+                retries,
+                status_code,
+                exc,
+            )
+
+            if attempt >= retries - 1:
+                break
+
+            # Backoff: 1s, 2s, 4s
+            await asyncio.sleep(
+                min(
+                    2 ** attempt,
+                    8,
+                )
+            )
+
+        except Exception as exc:
+            last_error = exc
+
+            logger.exception(
+                "Error API tidak terduga."
+            )
+
+            if attempt >= retries - 1:
+                break
+
+            await asyncio.sleep(1)
+
+    raise RuntimeError(
+        f"Gagal mengakses TON Center: "
+        f"{last_error}"
+    )
 
 
 async def get_ton_transactions(
@@ -200,12 +517,30 @@ async def get_ton_transactions(
         "transactions",
         {
             "account": WALLET_ADDRESS,
-            "limit": min(limit, 1000),
+            "limit": min(
+                max(limit, 1),
+                1000,
+            ),
             "sort": "desc",
         },
     )
 
-    return data.get("transactions", [])
+    transactions = data.get(
+        "transactions",
+        [],
+    )
+
+    if not isinstance(
+        transactions,
+        list,
+    ):
+        return []
+
+    return [
+        item
+        for item in transactions
+        if isinstance(item, dict)
+    ]
 
 
 async def get_jetton_wallets(
@@ -216,7 +551,10 @@ async def get_jetton_wallets(
         {
             "owner_address": WALLET_ADDRESS,
             "exclude_zero_balance": "true",
-            "limit": min(limit, 1000),
+            "limit": min(
+                max(limit, 1),
+                1000,
+            ),
             "sort": "desc",
         },
     )
@@ -230,9 +568,25 @@ async def get_account_state() -> dict[str, Any]:
         },
     )
 
-    states = data.get("account_states", [])
+    states = data.get(
+        "account_states",
+        [],
+    )
 
-    return states[0] if states else {}
+    if not isinstance(
+        states,
+        list,
+    ):
+        return {}
+
+    for state in states:
+        if isinstance(
+            state,
+            dict,
+        ):
+            return state
+
+    return {}
 
 
 async def get_jetton_transfers(
@@ -243,11 +597,17 @@ async def get_jetton_transfers(
     params: dict[str, Any] = {
         "owner_address": WALLET_ADDRESS,
         "jetton_master": jetton_master,
-        "limit": min(limit, 1000),
+        "limit": min(
+            max(limit, 1),
+            1000,
+        ),
         "sort": "desc",
     }
 
-    if direction in {"in", "out"}:
+    if direction in {
+        "in",
+        "out",
+    }:
         params["direction"] = direction
 
     data = await api_get(
@@ -255,31 +615,101 @@ async def get_jetton_transfers(
         params,
     )
 
-    return data.get("jetton_transfers", [])
+    transfers = data.get(
+        "jetton_transfers",
+        [],
+    )
 
+    if not isinstance(
+        transfers,
+        list,
+    ):
+        return []
+
+    return [
+        item
+        for item in transfers
+        if isinstance(item, dict)
+    ]
+
+
+# ============================================================
+# JETTON HELPERS
+# ============================================================
 
 def token_info_from_response(
     response: dict[str, Any],
     jetton_address: str,
 ) -> dict[str, Any]:
-    metadata = response.get("metadata", {})
+    metadata = response.get(
+        "metadata",
+        {},
+    )
 
-    for key in (
-        jetton_address,
-        jetton_address.replace("-", "_"),
+    if not isinstance(
+        metadata,
+        dict,
     ):
-        if key in metadata:
-            info = metadata[key].get("token_info", [])
+        return {}
 
-            if info:
-                return info[0]
+    possible_keys = (
+        jetton_address,
+        jetton_address.replace(
+            "-",
+            "_",
+        ),
+    )
+
+    for key in possible_keys:
+        value = metadata.get(key)
+
+        if not isinstance(
+            value,
+            dict,
+        ):
+            continue
+
+        info = value.get(
+            "token_info",
+            [],
+        )
+
+        if (
+            isinstance(info, list)
+            and info
+            and isinstance(
+                info[0],
+                dict,
+            )
+        ):
+            return info[0]
 
     for key, value in metadata.items():
-        if str(key) == str(jetton_address):
-            info = value.get("token_info", [])
+        if str(key) != str(
+            jetton_address
+        ):
+            continue
 
-            if info:
-                return info[0]
+        if not isinstance(
+            value,
+            dict,
+        ):
+            continue
+
+        info = value.get(
+            "token_info",
+            [],
+        )
+
+        if (
+            isinstance(info, list)
+            and info
+            and isinstance(
+                info[0],
+                dict,
+            )
+        ):
+            return info[0]
 
     return {}
 
@@ -288,30 +718,81 @@ def token_decimals(
     info: dict[str, Any],
     default: int = 9,
 ) -> int:
-    raw = info.get("decimals")
+    raw = info.get(
+        "decimals"
+    )
 
     if raw is None:
-        raw = (info.get("extra") or {}).get("decimals")
+        extra = info.get(
+            "extra"
+        )
+
+        if isinstance(
+            extra,
+            dict,
+        ):
+            raw = extra.get(
+                "decimals"
+            )
 
     try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return default
+        decimals = int(raw)
 
+        if 0 <= decimals <= 30:
+            return decimals
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        pass
+
+    return default
+
+
+# ============================================================
+# NORMALIZE TON EVENTS
+# ============================================================
 
 def normalize_ton_events(
     tx: dict[str, Any],
 ) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
 
-    now = int(tx.get("now") or 0)
-    tx_hash = str(tx.get("hash") or "")
-    lt = str(tx.get("lt") or "")
+    now = safe_int(
+        tx.get("now"),
+        0,
+    )
 
-    in_msg = tx.get("in_msg") or {}
+    tx_hash = str(
+        tx.get("hash")
+        or ""
+    )
 
-    source = in_msg.get("source") or ""
-    value = int(in_msg.get("value") or 0)
+    lt = str(
+        tx.get("lt")
+        or ""
+    )
+
+    in_msg = tx.get(
+        "in_msg"
+    )
+
+    if not isinstance(
+        in_msg,
+        dict,
+    ):
+        in_msg = {}
+
+    source = str(
+        in_msg.get("source")
+        or ""
+    )
+
+    value = safe_int(
+        in_msg.get("value"),
+        0,
+    )
 
     if (
         source
@@ -330,15 +811,41 @@ def normalize_ton_events(
                 "timestamp": now,
                 "lt": lt,
                 "hash": tx_hash,
-                "event_id": f"ton-in:{tx_hash}",
+                "aborted": False,
+                "event_id": (
+                    f"ton-in:{tx_hash}"
+                ),
             }
         )
 
-    for index, msg in enumerate(
-        tx.get("out_msgs") or []
+    out_msgs = tx.get(
+        "out_msgs"
+    )
+
+    if not isinstance(
+        out_msgs,
+        list,
     ):
-        destination = msg.get("destination") or ""
-        msg_value = int(msg.get("value") or 0)
+        out_msgs = []
+
+    for index, msg in enumerate(
+        out_msgs
+    ):
+        if not isinstance(
+            msg,
+            dict,
+        ):
+            continue
+
+        destination = str(
+            msg.get("destination")
+            or ""
+        )
+
+        msg_value = safe_int(
+            msg.get("value"),
+            0,
+        )
 
         if (
             destination
@@ -350,31 +857,87 @@ def normalize_ton_events(
                     "kind": "ton",
                     "direction": "out",
                     "symbol": "TON",
-                    "amount": format_ton(msg_value),
+                    "amount": format_ton(
+                        msg_value
+                    ),
                     "source": WALLET_ADDRESS,
                     "destination": destination,
                     "counterparty": destination,
                     "timestamp": now,
                     "lt": lt,
                     "hash": tx_hash,
-                    "event_id": f"ton-out:{tx_hash}:{index}",
+                    "aborted": False,
+                    "event_id": (
+                        f"ton-out:"
+                        f"{tx_hash}:"
+                        f"{index}"
+                    ),
                 }
             )
 
     return events
 
 
+# ============================================================
+# NORMALIZE USDT EVENTS
+# ============================================================
+
 def normalize_usdt_event(
     item: dict[str, Any],
     direction: str,
 ) -> dict[str, Any]:
-    source = item.get("source") or ""
-    destination = item.get("destination") or ""
+    source = str(
+        item.get("source")
+        or ""
+    )
+
+    destination = str(
+        item.get("destination")
+        or ""
+    )
 
     if direction == "out":
         counterparty = destination
     else:
         counterparty = source
+
+    transaction_hash = str(
+        item.get(
+            "transaction_hash"
+        )
+        or ""
+    )
+
+    transaction_lt = str(
+        item.get(
+            "transaction_lt"
+        )
+        or ""
+    )
+
+    transaction_now = safe_int(
+        item.get(
+            "transaction_now"
+        ),
+        0,
+    )
+
+    aborted_raw = item.get(
+        "transaction_aborted"
+    )
+
+    aborted = (
+        aborted_raw is True
+        or str(
+            aborted_raw
+        ).lower()
+        == "true"
+        or safe_int(
+            aborted_raw,
+            0,
+        )
+        == 1
+    )
 
     return {
         "kind": "usdt",
@@ -383,87 +946,152 @@ def normalize_usdt_event(
         "name": "Tether USD",
         "master": USDT_JETTON_MASTER,
         "amount": format_amount(
-            item.get("amount", "0"),
+            item.get(
+                "amount",
+                "0",
+            ),
             6,
         ),
         "source": source,
         "destination": destination,
         "counterparty": counterparty,
-        "timestamp": int(
-            item.get("transaction_now") or 0
-        ),
-        "lt": str(
-            item.get("transaction_lt") or ""
-        ),
-        "hash": str(
-            item.get("transaction_hash") or ""
-        ),
+        "timestamp": transaction_now,
+        "lt": transaction_lt,
+        "hash": transaction_hash,
         "trace_id": str(
-            item.get("trace_id") or ""
+            item.get(
+                "trace_id"
+            )
+            or ""
         ),
-        "aborted": bool(
-            item.get("transaction_aborted")
-        ),
+        "aborted": aborted,
         "event_id": (
             f"usdt:"
-            f"{item.get('transaction_hash', '')}:"
-            f"{item.get('transaction_lt', '')}:"
+            f"{transaction_hash}:"
+            f"{transaction_lt}:"
             f"{direction}"
         ),
     }
 
 
-async def get_recent_ton_events(
-    limit: int = 10,
-) -> list[dict[str, Any]]:
-    transactions = await get_ton_transactions(100)
+# ============================================================
+# SORT / UNIQUE EVENTS
+# ============================================================
 
-    events: list[dict[str, Any]] = []
-
-    for tx in transactions:
-        events.extend(
-            normalize_ton_events(tx)
-        )
-
-    events = [
-        event
-        for event in events
-        if not event.get("aborted")
-    ]
-
-    events.sort(
-        key=lambda event: (
-            int(event.get("timestamp") or 0),
-            (
-                int(event.get("lt") or 0)
-                if str(event.get("lt") or "").isdigit()
-                else 0
-            ),
+def event_sort_key(
+    event: dict[str, Any],
+) -> tuple[int, int]:
+    timestamp = safe_int(
+        event.get(
+            "timestamp"
         ),
+        0,
+    )
+
+    lt_raw = str(
+        event.get("lt")
+        or ""
+    )
+
+    lt = (
+        safe_int(
+            lt_raw,
+            0,
+        )
+        if lt_raw.isdigit()
+        else 0
+    )
+
+    return (
+        timestamp,
+        lt,
+    )
+
+
+def unique_events(
+    events: list[dict[str, Any]],
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    events.sort(
+        key=event_sort_key,
         reverse=True,
     )
 
-    unique: list[dict[str, Any]] = []
+    result: list[dict[str, Any]] = []
+
     seen: set[str] = set()
 
     for event in events:
         event_id = str(
-            event.get("event_id") or ""
+            event.get(
+                "event_id"
+            )
+            or ""
         )
 
-        if event_id and event_id in seen:
+        if (
+            event_id
+            and event_id in seen
+        ):
             continue
 
         if event_id:
             seen.add(event_id)
 
-        unique.append(event)
+        result.append(event)
 
-        if len(unique) >= limit:
+        if (
+            limit is not None
+            and len(result) >= limit
+        ):
             break
 
-    return unique
+    return result
 
+
+# ============================================================
+# RECENT TON
+# ============================================================
+
+async def get_recent_ton_events(
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    transactions = await get_ton_transactions(
+        100
+    )
+
+    events: list[dict[str, Any]] = []
+
+    for tx in transactions:
+        try:
+            events.extend(
+                normalize_ton_events(
+                    tx
+                )
+            )
+        except Exception:
+            logger.exception(
+                "Gagal normalize TON transaction."
+            )
+
+    events = [
+        event
+        for event in events
+        if not event.get(
+            "aborted",
+            False,
+        )
+    ]
+
+    return unique_events(
+        events,
+        limit,
+    )
+
+
+# ============================================================
+# RECENT USDT
+# ============================================================
 
 async def get_recent_usdt_events(
     limit: int = 10,
@@ -484,62 +1112,58 @@ async def get_recent_usdt_events(
     events: list[dict[str, Any]] = []
 
     for item in incoming:
-        event = normalize_usdt_event(
-            item,
-            "in",
-        )
+        try:
+            event = normalize_usdt_event(
+                item,
+                "in",
+            )
 
-        if not event["aborted"]:
-            events.append(event)
+            if not event.get(
+                "aborted",
+                False,
+            ):
+                events.append(event)
+
+        except Exception:
+            logger.exception(
+                "Gagal normalize USDT incoming."
+            )
 
     for item in outgoing:
-        event = normalize_usdt_event(
-            item,
-            "out",
-        )
+        try:
+            event = normalize_usdt_event(
+                item,
+                "out",
+            )
 
-        if not event["aborted"]:
-            events.append(event)
+            if not event.get(
+                "aborted",
+                False,
+            ):
+                events.append(event)
 
-    events.sort(
-        key=lambda event: (
-            int(event.get("timestamp") or 0),
-            (
-                int(event.get("lt") or 0)
-                if str(event.get("lt") or "").isdigit()
-                else 0
-            ),
-        ),
-        reverse=True,
+        except Exception:
+            logger.exception(
+                "Gagal normalize USDT outgoing."
+            )
+
+    return unique_events(
+        events,
+        limit,
     )
 
-    unique: list[dict[str, Any]] = []
-    seen: set[str] = set()
 
-    for event in events:
-        event_id = str(
-            event.get("event_id") or ""
-        )
-
-        if event_id and event_id in seen:
-            continue
-
-        if event_id:
-            seen.add(event_id)
-
-        unique.append(event)
-
-        if len(unique) >= limit:
-            break
-
-    return unique
-
+# ============================================================
+# FORMAT HISTORY
+# ============================================================
 
 def format_history_event(
     event: dict[str, Any],
     number: int,
 ) -> str:
-    direction = event.get("direction")
+    direction = event.get(
+        "direction"
+    )
 
     if direction == "in":
         icon = "🟢"
@@ -552,36 +1176,53 @@ def format_history_event(
         sign = "-"
         address_label = "Ke"
 
-    symbol = event.get(
-        "symbol",
-        "TON",
+    symbol = str(
+        event.get(
+            "symbol",
+            "TON",
+        )
     )
 
-    amount = event.get(
-        "amount",
-        "0",
+    amount = str(
+        event.get(
+            "amount",
+            "0",
+        )
     )
 
-    counterparty = event.get(
-        "counterparty"
-    ) or "-"
+    counterparty = str(
+        event.get(
+            "counterparty"
+        )
+        or "-"
+    )
 
     timestamp = fmt_time(
-        event.get("timestamp")
+        event.get(
+            "timestamp"
+        )
     )
 
     return (
         f"{number}. {icon} "
-        f"<b>{label} {html_escape(symbol)}</b>\n"
+        f"<b>{label} "
+        f"{html_escape(symbol)}</b>\n"
         f"Jumlah: {sign}"
         f"{html_escape(amount)} "
         f"{html_escape(symbol)}\n"
         f"{address_label}:\n"
-        f"<code>{html_escape(counterparty)}</code>\n"
-        f"🕐 {html_escape(timestamp)} "
+        f"<code>"
+        f"{html_escape(counterparty)}"
+        f"</code>\n"
+        f"🕐 "
+        f"{html_escape(timestamp)} "
         f"{html_escape(TIMEZONE_NAME)}"
     )
 
+
+# ============================================================
+# TELEGRAM - TON HISTORY
+# ============================================================
 
 async def show_ton_transactions(
     update: Update,
@@ -589,12 +1230,20 @@ async def show_ton_transactions(
 ) -> None:
     query = update.callback_query
 
-    await query.answer(
-        "Mengambil 10 transaksi TON..."
-    )
+    if query is None:
+        return
 
     try:
-        events = await get_recent_ton_events(10)
+        await query.answer(
+            "Mengambil 10 transaksi TON..."
+        )
+    except TelegramError:
+        pass
+
+    try:
+        events = await get_recent_ton_events(
+            10
+        )
 
         lines = [
             "🟣 <b>10 TRANSAKSI TON TERAKHIR</b>",
@@ -627,16 +1276,25 @@ async def show_ton_transactions(
 
     except Exception as exc:
         logger.exception(
-            "Gagal mengambil transaksi TON"
+            "Gagal mengambil transaksi TON."
         )
 
-        await query.edit_message_text(
-            "❌ Gagal mengambil transaksi TON.\n"
-            f"<code>{html_escape(exc)}</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=back_markup(),
-        )
+        try:
+            await query.edit_message_text(
+                "❌ Gagal mengambil transaksi TON.\n"
+                f"<code>"
+                f"{html_escape(exc)}"
+                f"</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=back_markup(),
+            )
+        except TelegramError:
+            pass
 
+
+# ============================================================
+# TELEGRAM - USDT HISTORY
+# ============================================================
 
 async def show_usdt_transactions(
     update: Update,
@@ -644,12 +1302,20 @@ async def show_usdt_transactions(
 ) -> None:
     query = update.callback_query
 
-    await query.answer(
-        "Mengambil 10 transaksi USDT..."
-    )
+    if query is None:
+        return
 
     try:
-        events = await get_recent_usdt_events(10)
+        await query.answer(
+            "Mengambil 10 transaksi USDT..."
+        )
+    except TelegramError:
+        pass
+
+    try:
+        events = await get_recent_usdt_events(
+            10
+        )
 
         lines = [
             "🪙 <b>10 TRANSAKSI USDT TERAKHIR</b>",
@@ -682,19 +1348,28 @@ async def show_usdt_transactions(
 
     except Exception as exc:
         logger.exception(
-            "Gagal mengambil transaksi USDT"
+            "Gagal mengambil transaksi USDT."
         )
 
-        await query.edit_message_text(
-            "❌ Gagal mengambil transaksi USDT.\n"
-            f"<code>{html_escape(exc)}</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=back_markup(),
-        )
+        try:
+            await query.edit_message_text(
+                "❌ Gagal mengambil transaksi USDT.\n"
+                f"<code>"
+                f"{html_escape(exc)}"
+                f"</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=back_markup(),
+            )
+        except TelegramError:
+            pass
 
+
+# ============================================================
+# MONITOR EVENTS
+# ============================================================
 
 async def get_monitor_events() -> list[dict[str, Any]]:
-    ton_txs, usdt_in, usdt_out = await asyncio.gather(
+    results = await asyncio.gather(
         get_ton_transactions(50),
         get_jetton_transfers(
             USDT_JETTON_MASTER,
@@ -706,47 +1381,110 @@ async def get_monitor_events() -> list[dict[str, Any]]:
             "out",
             100,
         ),
+        return_exceptions=True,
     )
+
+    ton_result = results[0]
+    usdt_in_result = results[1]
+    usdt_out_result = results[2]
 
     events: list[dict[str, Any]] = []
 
-    for tx in ton_txs:
-        events.extend(
-            normalize_ton_events(tx)
+    # ------------------------------
+    # TON
+    # ------------------------------
+
+    if isinstance(
+        ton_result,
+        Exception,
+    ):
+        logger.warning(
+            "TON monitor request gagal: %s",
+            ton_result,
         )
+    else:
+        for tx in ton_result:
+            try:
+                events.extend(
+                    normalize_ton_events(
+                        tx
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Gagal normalize TON event."
+                )
 
-    for item in usdt_in:
-        event = normalize_usdt_event(
-            item,
-            "in",
+    # ------------------------------
+    # USDT IN
+    # ------------------------------
+
+    if isinstance(
+        usdt_in_result,
+        Exception,
+    ):
+        logger.warning(
+            "USDT incoming request gagal: %s",
+            usdt_in_result,
         )
+    else:
+        for item in usdt_in_result:
+            try:
+                event = normalize_usdt_event(
+                    item,
+                    "in",
+                )
 
-        if not event["aborted"]:
-            events.append(event)
+                if not event.get(
+                    "aborted",
+                    False,
+                ):
+                    events.append(event)
 
-    for item in usdt_out:
-        event = normalize_usdt_event(
-            item,
-            "out",
+            except Exception:
+                logger.exception(
+                    "Gagal normalize USDT incoming."
+                )
+
+    # ------------------------------
+    # USDT OUT
+    # ------------------------------
+
+    if isinstance(
+        usdt_out_result,
+        Exception,
+    ):
+        logger.warning(
+            "USDT outgoing request gagal: %s",
+            usdt_out_result,
         )
+    else:
+        for item in usdt_out_result:
+            try:
+                event = normalize_usdt_event(
+                    item,
+                    "out",
+                )
 
-        if not event["aborted"]:
-            events.append(event)
+                if not event.get(
+                    "aborted",
+                    False,
+                ):
+                    events.append(event)
 
-    events.sort(
-        key=lambda event: (
-            int(event.get("timestamp") or 0),
-            (
-                int(event.get("lt") or 0)
-                if str(event.get("lt") or "").isdigit()
-                else 0
-            ),
-        ),
-        reverse=True,
+            except Exception:
+                logger.exception(
+                    "Gagal normalize USDT outgoing."
+                )
+
+    return unique_events(
+        events
     )
 
-    return events
 
+# ============================================================
+# SEND NOTIFICATION
+# ============================================================
 
 async def send_event_notification(
     application: Application,
@@ -755,7 +1493,9 @@ async def send_event_notification(
     if not monitor_chats:
         return
 
-    direction = event.get("direction")
+    direction = event.get(
+        "direction"
+    )
 
     if direction == "in":
         icon = "🟢"
@@ -766,30 +1506,46 @@ async def send_event_notification(
         label = "SALDO KELUAR"
         sign = "-"
 
-    symbol = event.get(
-        "symbol",
-        "TON",
+    symbol = str(
+        event.get(
+            "symbol",
+            "TON",
+        )
     )
 
-    source = event.get(
-        "source"
-    ) or "-"
+    source = str(
+        event.get(
+            "source"
+        )
+        or "-"
+    )
 
-    destination = event.get(
-        "destination"
-    ) or "-"
+    destination = str(
+        event.get(
+            "destination"
+        )
+        or "-"
+    )
 
-    amount = event.get(
-        "amount"
-    ) or "0"
+    amount = str(
+        event.get(
+            "amount"
+        )
+        or "0"
+    )
 
     timestamp = fmt_time(
-        event.get("timestamp")
+        event.get(
+            "timestamp"
+        )
     )
 
-    tx_hash = event.get(
-        "hash"
-    ) or ""
+    tx_hash = str(
+        event.get(
+            "hash"
+        )
+        or ""
+    )
 
     text = (
         "🚨 <b>TRANSAKSI BARU</b>\n\n"
@@ -798,22 +1554,36 @@ async def send_event_notification(
         f"{html_escape(amount)} "
         f"{html_escape(symbol)}</b>\n\n"
         f"📤 Pengirim:\n"
-        f"<code>{html_escape(source)}</code>\n\n"
+        f"<code>"
+        f"{html_escape(source)}"
+        f"</code>\n\n"
         f"📥 Penerima:\n"
-        f"<code>{html_escape(destination)}</code>\n\n"
-        f"📅 {html_escape(timestamp)} "
+        f"<code>"
+        f"{html_escape(destination)}"
+        f"</code>\n\n"
+        f"📅 "
+        f"{html_escape(timestamp)} "
         f"{html_escape(TIMEZONE_NAME)}\n"
     )
 
     if tx_hash:
+        safe_hash = html_escape(
+            tx_hash
+        )
+
         text += (
-            f'\n🔗 <a href="{explorer_url(tx_hash)}">'
-            "Lihat transaksi di Tonviewer</a>"
+            f'\n🔗 <a href="'
+            f'{explorer_url(safe_hash)}'
+            f'">'
+            "Lihat transaksi di Tonviewer"
+            "</a>"
         )
 
     failed: list[str] = []
 
-    for chat_id in list(monitor_chats):
+    for chat_id in list(
+        monitor_chats
+    ):
         try:
             await application.bot.send_message(
                 chat_id=chat_id,
@@ -821,17 +1591,68 @@ async def send_event_notification(
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
-        except Exception as exc:
+
+        except Forbidden as exc:
             logger.warning(
-                "Gagal mengirim notifikasi ke %s: %s",
+                "Bot tidak punya akses "
+                "ke chat %s: %s",
                 chat_id,
                 exc,
             )
-            failed.append(chat_id)
+
+            failed.append(
+                chat_id
+            )
+
+        except BadRequest as exc:
+            logger.warning(
+                "Telegram BadRequest "
+                "untuk chat %s: %s",
+                chat_id,
+                exc,
+            )
+
+            # Jangan langsung menghapus chat
+            # kecuali jelas chat tidak tersedia.
+            error_text = str(
+                exc
+            ).lower()
+
+            if (
+                "chat not found"
+                in error_text
+                or "user is deactivated"
+                in error_text
+            ):
+                failed.append(
+                    chat_id
+                )
+
+        except TelegramError as exc:
+            logger.warning(
+                "Telegram error "
+                "untuk chat %s: %s",
+                chat_id,
+                exc,
+            )
+
+        except Exception as exc:
+            logger.exception(
+                "Error kirim notifikasi "
+                "ke chat %s: %s",
+                chat_id,
+                exc,
+            )
 
     for chat_id in failed:
-        monitor_chats.discard(chat_id)
+        monitor_chats.discard(
+            chat_id
+        )
 
+
+# ============================================================
+# MONITOR LOOP
+# ============================================================
 
 async def monitor_loop(
     application: Application,
@@ -839,22 +1660,48 @@ async def monitor_loop(
     global baseline_ready
 
     logger.info(
-        "Monitoring aktif: wallet=%s, "
-        "USDT master=%s, interval=%ss",
+        "Monitoring aktif."
+    )
+
+    logger.info(
+        "Wallet: %s",
         WALLET_ADDRESS,
+    )
+
+    logger.info(
+        "USDT master: %s",
         USDT_JETTON_MASTER,
+    )
+
+    logger.info(
+        "Interval: %s detik",
         POLL_SECONDS,
     )
+
+    # ------------------------------
+    # Initial delay
+    # ------------------------------
+    await asyncio.sleep(2)
 
     while True:
         try:
             events = await get_monitor_events()
 
             current_ids = {
-                event["event_id"]
+                str(
+                    event.get(
+                        "event_id"
+                    )
+                )
                 for event in events
-                if event.get("event_id")
+                if event.get(
+                    "event_id"
+                )
             }
+
+            # --------------------------
+            # BASELINE
+            # --------------------------
 
             if not baseline_ready:
                 seen_event_ids.update(
@@ -868,78 +1715,169 @@ async def monitor_loop(
                     len(current_ids),
                 )
 
+            # --------------------------
+            # DETECT NEW EVENTS
+            # --------------------------
+
             else:
                 new_events = [
                     event
                     for event in events
-                    if event.get("event_id")
-                    and event["event_id"]
-                    not in seen_event_ids
-                    and not event.get("aborted")
+                    if (
+                        event.get(
+                            "event_id"
+                        )
+                        and event.get(
+                            "event_id"
+                        )
+                        not in seen_event_ids
+                        and not event.get(
+                            "aborted",
+                            False,
+                        )
+                    )
                 ]
 
-                for event in new_events:
-                    seen_event_ids.add(
-                        event["event_id"]
+                if new_events:
+                    logger.info(
+                        "Ditemukan %d transaksi baru.",
+                        len(new_events),
                     )
 
+                for event in new_events:
+                    event_id = event.get(
+                        "event_id"
+                    )
+
+                    if event_id:
+                        seen_event_ids.add(
+                            str(event_id)
+                        )
+
+                # oldest -> newest
                 for event in reversed(
                     new_events
                 ):
-                    await send_event_notification(
-                        application,
-                        event,
-                    )
+                    try:
+                        await send_event_notification(
+                            application,
+                            event,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Gagal mengirim "
+                            "notifikasi event."
+                        )
 
-                if len(seen_event_ids) > 5000:
-                    seen_event_ids.clear()
-                    seen_event_ids.update(
-                        current_ids
-                    )
+            # --------------------------
+            # LIMIT MEMORY
+            # --------------------------
+
+            if len(
+                seen_event_ids
+            ) > 5000:
+                logger.info(
+                    "Reset event cache. "
+                    "Total sebelumnya=%d",
+                    len(seen_event_ids),
+                )
+
+                seen_event_ids.clear()
+
+                seen_event_ids.update(
+                    current_ids
+                )
 
         except asyncio.CancelledError:
+            logger.info(
+                "Monitor loop dihentikan."
+            )
             raise
 
         except Exception:
             logger.exception(
-                "Error pada monitor loop"
+                "Error pada monitor loop. "
+                "Loop tetap berjalan."
             )
 
-        await asyncio.sleep(
-            POLL_SECONDS
-        )
+        try:
+            await asyncio.sleep(
+                POLL_SECONDS
+            )
+        except asyncio.CancelledError:
+            raise
 
+
+# ============================================================
+# /START
+# ============================================================
 
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
+    message = update.effective_message
+
+    if message is None:
+        return
+
     text = (
         "👋 <b>TON Wallet Monitor</b>\n\n"
         "Wallet yang dipantau:\n"
-        f"<code>{html_escape(WALLET_ADDRESS)}</code>\n\n"
+        f"<code>"
+        f"{html_escape(WALLET_ADDRESS)}"
+        f"</code>\n\n"
         "🟣 TON + 🪙 USDT dipantau.\n\n"
         "Pilih menu di bawah:"
     )
 
-    await update.effective_message.reply_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=menu_markup(),
-        disable_web_page_preview=True,
-    )
+    try:
+        await message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=menu_markup(),
+            disable_web_page_preview=True,
+        )
+    except TelegramError:
+        logger.exception(
+            "Gagal mengirim /start."
+        )
 
+
+# ============================================================
+# /CHATID
+# ============================================================
 
 async def chat_id_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    await update.effective_message.reply_text(
-        f"Chat ID Anda:\n"
-        f"<code>{update.effective_chat.id}</code>",
-        parse_mode=ParseMode.HTML,
-    )
+    message = update.effective_message
+    chat = update.effective_chat
 
+    if (
+        message is None
+        or chat is None
+    ):
+        return
+
+    try:
+        await message.reply_text(
+            "Chat ID Anda:\n"
+            f"<code>"
+            f"{html_escape(chat.id)}"
+            f"</code>",
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError:
+        logger.exception(
+            "Gagal mengirim /chatid."
+        )
+
+
+# ============================================================
+# BALANCE
+# ============================================================
 
 async def show_balance(
     update: Update,
@@ -947,24 +1885,74 @@ async def show_balance(
 ) -> None:
     query = update.callback_query
 
-    await query.answer(
-        "Mengambil saldo..."
-    )
+    if query is None:
+        return
 
     try:
-        state, wallets_response = await asyncio.gather(
-            get_account_state(),
-            get_jetton_wallets(100),
+        await query.answer(
+            "Mengambil saldo..."
+        )
+    except TelegramError:
+        pass
+
+    try:
+        state_result, wallets_result = (
+            await asyncio.gather(
+                get_account_state(),
+                get_jetton_wallets(100),
+                return_exceptions=True,
+            )
+        )
+
+        # --------------------------
+        # ACCOUNT STATE
+        # --------------------------
+
+        if isinstance(
+            state_result,
+            Exception,
+        ):
+            raise RuntimeError(
+                f"Gagal mengambil saldo TON: "
+                f"{state_result}"
+            )
+
+        # --------------------------
+        # JETTON WALLET
+        # --------------------------
+
+        if isinstance(
+            wallets_result,
+            Exception,
+        ):
+            raise RuntimeError(
+                f"Gagal mengambil saldo Jetton: "
+                f"{wallets_result}"
+            )
+
+        state = state_result
+
+        wallets_response = (
+            wallets_result
         )
 
         ton_balance = format_ton(
-            state.get("balance", "0")
+            state.get(
+                "balance",
+                "0",
+            )
         )
 
         wallets = wallets_response.get(
             "jetton_wallets",
             [],
         )
+
+        if not isinstance(
+            wallets,
+            list,
+        ):
+            wallets = []
 
         lines = [
             "💰 <b>INFO SALDO</b>",
@@ -978,37 +1966,55 @@ async def show_balance(
 
         if not wallets:
             lines.append(
-                "Tidak ada Jetton dengan saldo &gt; 0."
+                "Tidak ada Jetton "
+                "dengan saldo &gt; 0."
             )
 
         else:
             for wallet in wallets[:30]:
-                master = wallet.get(
-                    "jetton"
-                ) or ""
+                if not isinstance(
+                    wallet,
+                    dict,
+                ):
+                    continue
 
-                info = token_info_from_response(
-                    wallets_response,
-                    master,
+                master = str(
+                    wallet.get(
+                        "jetton"
+                    )
+                    or ""
+                )
+
+                info = (
+                    token_info_from_response(
+                        wallets_response,
+                        master,
+                    )
                 )
 
                 symbol = (
-                    info.get("symbol")
+                    info.get(
+                        "symbol"
+                    )
                     or (
                         "USDT"
-                        if master == USDT_JETTON_MASTER
+                        if master
+                        == USDT_JETTON_MASTER
                         else "JETTON"
                     )
                 )
 
                 name = (
-                    info.get("name")
+                    info.get(
+                        "name"
+                    )
                     or symbol
                 )
 
                 decimals = (
                     6
-                    if master == USDT_JETTON_MASTER
+                    if master
+                    == USDT_JETTON_MASTER
                     else token_decimals(
                         info,
                         9,
@@ -1028,7 +2034,8 @@ async def show_balance(
                     f"{html_escape(symbol)}"
                     f"</b> — "
                     f"{html_escape(balance)}\n"
-                    f"  {html_escape(name)}"
+                    f"  "
+                    f"{html_escape(name)}"
                 )
 
         lines.extend(
@@ -1038,7 +2045,7 @@ async def show_balance(
                 f"<code>"
                 f"{html_escape(WALLET_ADDRESS)}"
                 f"</code>",
-                f"🕐 Update: "
+                "🕐 Update: "
                 f"{html_escape(fmt_time(time.time()))} "
                 f"{html_escape(TIMEZONE_NAME)}",
             ]
@@ -1053,16 +2060,25 @@ async def show_balance(
 
     except Exception as exc:
         logger.exception(
-            "Gagal mengambil saldo"
+            "Gagal mengambil saldo."
         )
 
-        await query.edit_message_text(
-            "❌ Gagal mengambil saldo.\n"
-            f"<code>{html_escape(exc)}</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=back_markup(),
-        )
+        try:
+            await query.edit_message_text(
+                "❌ Gagal mengambil saldo.\n"
+                f"<code>"
+                f"{html_escape(exc)}"
+                f"</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=back_markup(),
+            )
+        except TelegramError:
+            pass
 
+
+# ============================================================
+# TOKENS
+# ============================================================
 
 async def show_tokens(
     update: Update,
@@ -1070,9 +2086,15 @@ async def show_tokens(
 ) -> None:
     query = update.callback_query
 
-    await query.answer(
-        "Mengambil token..."
-    )
+    if query is None:
+        return
+
+    try:
+        await query.answer(
+            "Mengambil token..."
+        )
+    except TelegramError:
+        pass
 
     try:
         response = await get_jetton_wallets(
@@ -1084,6 +2106,12 @@ async def show_tokens(
             [],
         )
 
+        if not isinstance(
+            wallets,
+            list,
+        ):
+            wallets = []
+
         lines = [
             "🪙 <b>TOKEN YANG DIMILIKI</b>",
             "",
@@ -1091,7 +2119,8 @@ async def show_tokens(
 
         if not wallets:
             lines.append(
-                "Tidak ada Jetton dengan saldo &gt; 0."
+                "Tidak ada Jetton "
+                "dengan saldo &gt; 0."
             )
 
         else:
@@ -1099,32 +2128,49 @@ async def show_tokens(
                 wallets[:50],
                 1,
             ):
-                master = wallet.get(
-                    "jetton"
-                ) or ""
+                if not isinstance(
+                    wallet,
+                    dict,
+                ):
+                    continue
 
-                info = token_info_from_response(
-                    response,
-                    master,
+                master = str(
+                    wallet.get(
+                        "jetton"
+                    )
+                    or ""
+                )
+
+                info = (
+                    token_info_from_response(
+                        response,
+                        master,
+                    )
                 )
 
                 symbol = (
-                    info.get("symbol")
+                    info.get(
+                        "symbol"
+                    )
                     or (
                         "USDT"
-                        if master == USDT_JETTON_MASTER
+                        if master
+                        == USDT_JETTON_MASTER
                         else "JETTON"
                     )
                 )
 
                 name = (
-                    info.get("name")
+                    info.get(
+                        "name"
+                    )
                     or symbol
                 )
 
                 decimals = (
                     6
-                    if master == USDT_JETTON_MASTER
+                    if master
+                    == USDT_JETTON_MASTER
                     else token_decimals(
                         info,
                         9,
@@ -1143,9 +2189,12 @@ async def show_tokens(
                     f"<b>{i}. "
                     f"{html_escape(symbol)}</b> — "
                     f"{html_escape(balance)}\n"
-                    f"   {html_escape(name)}\n"
+                    f"   "
+                    f"{html_escape(name)}\n"
                     f"   Master: "
-                    f"<code>{html_escape(master)}</code>"
+                    f"<code>"
+                    f"{html_escape(master)}"
+                    f"</code>"
                 )
 
         await query.edit_message_text(
@@ -1157,16 +2206,25 @@ async def show_tokens(
 
     except Exception as exc:
         logger.exception(
-            "Gagal mengambil daftar token"
+            "Gagal mengambil daftar token."
         )
 
-        await query.edit_message_text(
-            "❌ Gagal mengambil token.\n"
-            f"<code>{html_escape(exc)}</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=back_markup(),
-        )
+        try:
+            await query.edit_message_text(
+                "❌ Gagal mengambil token.\n"
+                f"<code>"
+                f"{html_escape(exc)}"
+                f"</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=back_markup(),
+            )
+        except TelegramError:
+            pass
 
+
+# ============================================================
+# MONITOR BUTTON
+# ============================================================
 
 async def show_monitor(
     update: Update,
@@ -1174,14 +2232,27 @@ async def show_monitor(
 ) -> None:
     query = update.callback_query
 
-    await query.answer()
+    if query is None:
+        return
+
+    try:
+        await query.answer()
+    except TelegramError:
+        pass
+
+    message = query.message
+
+    if message is None:
+        return
 
     chat_id = str(
-        query.message.chat.id
+        message.chat.id
     )
 
     if chat_id in monitor_chats:
-        monitor_chats.remove(chat_id)
+        monitor_chats.remove(
+            chat_id
+        )
 
         status_text = (
             "⚪ Notifikasi otomatis "
@@ -1189,7 +2260,9 @@ async def show_monitor(
         )
 
     else:
-        monitor_chats.add(chat_id)
+        monitor_chats.add(
+            chat_id
+        )
 
         status_text = (
             "🟢 Notifikasi otomatis "
@@ -1205,14 +2278,23 @@ async def show_monitor(
         f"<b>{POLL_SECONDS} detik</b>"
     )
 
-    await query.edit_message_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=monitor_markup(
-            chat_id
-        ),
-    )
+    try:
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=monitor_markup(
+                chat_id
+            ),
+        )
+    except TelegramError:
+        logger.exception(
+            "Gagal menampilkan status monitor."
+        )
 
+
+# ============================================================
+# HOME
+# ============================================================
 
 async def show_home(
     update: Update,
@@ -1220,79 +2302,124 @@ async def show_home(
 ) -> None:
     query = update.callback_query
 
-    await query.answer()
+    if query is None:
+        return
 
-    await query.edit_message_text(
-        "🏠 <b>TON WALLET MONITOR</b>\n\n"
-        "Pilih menu:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=menu_markup(),
-    )
+    try:
+        await query.answer()
+    except TelegramError:
+        pass
 
+    try:
+        await query.edit_message_text(
+            "🏠 <b>TON WALLET MONITOR</b>\n\n"
+            "Pilih menu:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=menu_markup(),
+        )
+    except TelegramError:
+        logger.exception(
+            "Gagal menampilkan home."
+        )
+
+
+# ============================================================
+# CALLBACK HANDLER
+# ============================================================
 
 async def button_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     query = update.callback_query
-    data = query.data
 
-    if data == "balance":
-        await show_balance(
-            update,
-            context,
+    if query is None:
+        return
+
+    data = (
+        query.data
+        or ""
+    )
+
+    try:
+        if data == "balance":
+            await show_balance(
+                update,
+                context,
+            )
+
+        elif data == "tx_ton":
+            await show_ton_transactions(
+                update,
+                context,
+            )
+
+        elif data == "tx_usdt":
+            await show_usdt_transactions(
+                update,
+                context,
+            )
+
+        elif data == "tokens":
+            await show_tokens(
+                update,
+                context,
+            )
+
+        elif data == "monitor":
+            await show_monitor(
+                update,
+                context,
+            )
+
+        elif data == "home":
+            await show_home(
+                update,
+                context,
+            )
+
+        else:
+            try:
+                await query.answer(
+                    "Menu tidak dikenal.",
+                    show_alert=True,
+                )
+            except TelegramError:
+                pass
+
+    except Exception:
+        logger.exception(
+            "Unhandled error pada "
+            "button_handler."
         )
 
-    elif data == "tx_ton":
-        await show_ton_transactions(
-            update,
-            context,
-        )
+        try:
+            await query.answer(
+                "❌ Terjadi error. "
+                "Coba lagi.",
+                show_alert=True,
+            )
+        except TelegramError:
+            pass
 
-    elif data == "tx_usdt":
-        await show_usdt_transactions(
-            update,
-            context,
-        )
 
-    elif data == "tokens":
-        await show_tokens(
-            update,
-            context,
-        )
-
-    elif data == "monitor":
-        await show_monitor(
-            update,
-            context,
-        )
-
-    elif data == "home":
-        await show_home(
-            update,
-            context,
-        )
-
-    else:
-        await query.answer(
-            "Menu tidak dikenal.",
-            show_alert=True,
-        )
-
+# ============================================================
+# POST INIT
+# ============================================================
 
 async def post_init(
     application: Application,
 ) -> None:
     global http_client
+    global monitor_task
 
-    timeout = httpx.Timeout(
-        20.0,
-        connect=10.0,
+    logger.info(
+        "Menjalankan post_init..."
     )
 
-    http_client = httpx.AsyncClient(
-        timeout=timeout
-    )
+    # ------------------------------
+    # Validate Telegram token
+    # ------------------------------
 
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError(
@@ -1300,94 +2427,266 @@ async def post_init(
             "Tambahkan di Railway Variables."
         )
 
+    # ------------------------------
+    # Validate TON Center URL
+    # ------------------------------
+
+    if not TONCENTER_BASE.startswith(
+        ("http://", "https://")
+    ):
+        raise RuntimeError(
+            "TONCENTER_BASE tidak valid."
+        )
+
+    # ------------------------------
+    # HTTP CLIENT
+    # ------------------------------
+
+    timeout = httpx.Timeout(
+        timeout=30.0,
+        connect=10.0,
+        read=30.0,
+        write=30.0,
+        pool=10.0,
+    )
+
+    limits = httpx.Limits(
+        max_connections=20,
+        max_keepalive_connections=10,
+    )
+
+    http_client = httpx.AsyncClient(
+        timeout=timeout,
+        limits=limits,
+        follow_redirects=True,
+    )
+
+    # ------------------------------
+    # API KEY WARNING
+    # ------------------------------
+
     if not TONCENTER_API_KEY:
         logger.warning(
-            "TONCENTER_API_KEY belum diset; "
-            "request API v3 akan terkena "
-            "rate limit publik."
+            "TONCENTER_API_KEY belum diset. "
+            "API publik dapat terkena rate limit."
         )
+    else:
+        logger.info(
+            "TONCENTER_API_KEY terdeteksi."
+        )
+
+    # ------------------------------
+    # START MONITOR TASK
+    # ------------------------------
+
+    monitor_task = asyncio.create_task(
+        monitor_loop(application),
+        name="ton-wallet-monitor",
+    )
 
     application.bot_data[
         "monitor_task"
-    ] = asyncio.create_task(
-        monitor_loop(application)
+    ] = monitor_task
+
+    logger.info(
+        "Monitor task berhasil dibuat."
     )
 
+
+# ============================================================
+# POST SHUTDOWN
+# ============================================================
 
 async def post_shutdown(
     application: Application,
 ) -> None:
     global http_client
+    global monitor_task
 
-    task = application.bot_data.get(
-        "monitor_task"
+    logger.info(
+        "Menjalankan post_shutdown..."
     )
 
-    if task:
-        task.cancel()
+    # ------------------------------
+    # STOP MONITOR
+    # ------------------------------
+
+    task = monitor_task
+
+    if task is None:
+        task = application.bot_data.get(
+            "monitor_task"
+        )
+
+    if task is not None:
+        if not task.done():
+            task.cancel()
 
         try:
             await task
         except asyncio.CancelledError:
             pass
+        except Exception:
+            logger.exception(
+                "Error saat shutdown "
+                "monitor task."
+            )
 
-    if http_client:
-        await http_client.aclose()
+    monitor_task = None
+
+    # ------------------------------
+    # CLOSE HTTP
+    # ------------------------------
+
+    if http_client is not None:
+        try:
+            await http_client.aclose()
+        except Exception:
+            logger.exception(
+                "Error menutup HTTP client."
+            )
+
         http_client = None
 
+    logger.info(
+        "Shutdown selesai."
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main() -> None:
-    if not TELEGRAM_BOT_TOKEN:
-        raise SystemExit(
-            "ERROR: TELEGRAM_BOT_TOKEN "
-            "belum diset sebagai environment variable."
-        )
-
-    application = (
-        ApplicationBuilder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "start",
-            start,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "menu",
-            start,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "chatid",
-            chat_id_command,
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            button_handler
-        )
+    logger.info(
+        "======================================"
     )
 
     logger.info(
-        "Bot Telegram mulai polling..."
+        "TON Wallet Monitor starting..."
     )
 
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
+    logger.info(
+        "Python process started."
     )
 
+    logger.info(
+        "Wallet: %s",
+        WALLET_ADDRESS,
+    )
+
+    logger.info(
+        "Timezone: %s",
+        TIMEZONE_NAME,
+    )
+
+    logger.info(
+        "Poll interval: %s seconds",
+        POLL_SECONDS,
+    )
+
+    logger.info(
+        "Auto monitor chats: %d",
+        len(
+            AUTO_MONITOR_CHAT_IDS
+        ),
+    )
+
+    logger.info(
+        "======================================"
+    )
+
+    if not TELEGRAM_BOT_TOKEN:
+        raise SystemExit(
+            "ERROR: TELEGRAM_BOT_TOKEN "
+            "belum diset sebagai "
+            "environment variable."
+        )
+
+    try:
+        application = (
+            ApplicationBuilder()
+            .token(
+                TELEGRAM_BOT_TOKEN
+            )
+            .post_init(
+                post_init
+            )
+            .post_shutdown(
+                post_shutdown
+            )
+            .build()
+        )
+
+        # --------------------------
+        # COMMANDS
+        # --------------------------
+
+        application.add_handler(
+            CommandHandler(
+                "start",
+                start,
+            )
+        )
+
+        application.add_handler(
+            CommandHandler(
+                "menu",
+                start,
+            )
+        )
+
+        application.add_handler(
+            CommandHandler(
+                "chatid",
+                chat_id_command,
+            )
+        )
+
+        # --------------------------
+        # BUTTONS
+        # --------------------------
+
+        application.add_handler(
+            CallbackQueryHandler(
+                button_handler
+            )
+        )
+
+        logger.info(
+            "Telegram handlers siap."
+        )
+
+        logger.info(
+            "Bot mulai polling..."
+        )
+
+        application.run_polling(
+            allowed_updates=(
+                Update.ALL_TYPES
+            ),
+            drop_pending_updates=True,
+            close_loop=True,
+        )
+
+    except KeyboardInterrupt:
+        logger.info(
+            "Bot dihentikan manual."
+        )
+
+    except SystemExit:
+        raise
+
+    except Exception:
+        logger.exception(
+            "FATAL ERROR pada main()."
+        )
+        raise
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
-```0
