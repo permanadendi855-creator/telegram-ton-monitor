@@ -3,6 +3,8 @@ import asyncio
 import time
 import logging
 import base64
+import json
+from pathlib import Path
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -73,6 +75,21 @@ AUTO_MONITOR_CHAT_IDS = {
     if x.strip()
 }
 
+# Saat bot baru dipasang / state lama belum tersedia, ambil transaksi
+# beberapa jam terakhir agar transaksi yang terjadi ketika bot mati tetap
+# bisa diberitahukan. Default 48 jam. Bisa diubah di Railway Variables.
+MONITOR_CATCHUP_SECONDS = max(
+    0,
+    int(os.getenv("MONITOR_CATCHUP_SECONDS", "172800")),
+)
+
+# ID transaksi yang sudah pernah diproses disimpan agar restart/redeploy
+# tidak mengirim notifikasi yang sama berulang kali.
+MONITOR_STATE_FILE = os.getenv(
+    "MONITOR_STATE_FILE",
+    "monitor_state.json",
+).strip() or "monitor_state.json"
+
 # ============================================================
 # GLOBAL STATE
 # ============================================================
@@ -97,7 +114,49 @@ monitor_chats: set[str] = set(
 
 seen_event_ids: set[str] = set()
 
-baseline_ready = False
+state_file_exists = False
+
+# ============================================================
+# MONITOR STATE PERSISTENCE
+# ============================================================
+
+def load_monitor_state() -> bool:
+    """Load event IDs already notified. Returns True if a valid state file exists."""
+    global state_file_exists
+    try:
+        path = Path(MONITOR_STATE_FILE)
+        if not path.exists():
+            state_file_exists = False
+            return False
+        data = json.loads(path.read_text(encoding="utf-8"))
+        ids = data.get("seen_event_ids", []) if isinstance(data, dict) else []
+        if isinstance(ids, list):
+            seen_event_ids.update(str(x) for x in ids if x)
+        state_file_exists = True
+        logger.info("State monitor dimuat: %d event sudah diproses.", len(seen_event_ids))
+        return True
+    except Exception:
+        state_file_exists = False
+        logger.exception("Gagal membaca state monitor; akan melakukan catch-up sesuai MONITOR_CATCHUP_SECONDS.")
+        return False
+
+def save_monitor_state() -> None:
+    try:
+        path = Path(MONITOR_STATE_FILE)
+        if path.parent != Path("."):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        # Simpan hanya ID terbaru agar file tidak membesar terus.
+        ids = list(seen_event_ids)[-5000:]
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps({"seen_event_ids": ids}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    except Exception:
+        logger.exception("Gagal menyimpan state monitor.")
+
+state_loaded = load_monitor_state()
 
 http_client: httpx.AsyncClient | None = None
 
@@ -623,25 +682,82 @@ async def send_event_notification(application: Application, event: dict[str, Any
 # ============================================================
 
 async def monitor_loop(application: Application) -> None:
-    global baseline_ready
-    logger.info("Monitoring aktif: wallet=%s, USDT master=%s, interval=%ss", WALLET_ADDRESS, USDT_JETTON_MASTER, POLL_SECONDS)
+    global state_file_exists
+    logger.info(
+        "Monitoring aktif: wallet=%s, USDT master=%s, interval=%ss, catchup=%ss",
+        WALLET_ADDRESS,
+        USDT_JETTON_MASTER,
+        POLL_SECONDS,
+        MONITOR_CATCHUP_SECONDS,
+    )
+    first_poll = True
     while True:
         try:
-            events = (await get_monitor_events())
-            current_ids = {event["event_id"] for event in events if event.get("event_id")}
-            if not baseline_ready:
+            events = await get_monitor_events()
+            now_ts = int(time.time())
+
+            # Pada pemasangan pertama / state hilang, kirim event yang terjadi
+            # selama periode catch-up. Setelah itu semua event ditandai sebagai
+            # sudah diproses supaya tidak dikirim berulang pada polling berikutnya.
+            if first_poll and not state_file_exists:
+                if MONITOR_CATCHUP_SECONDS > 0:
+                    cutoff = now_ts - MONITOR_CATCHUP_SECONDS
+                    catchup_events = [
+                        event
+                        for event in events
+                        if (
+                            event.get("event_id")
+                            and not event.get("aborted")
+                            and int(event.get("timestamp") or 0) >= cutoff
+                        )
+                    ]
+                    for event in reversed(catchup_events):
+                        await send_event_notification(application, event)
+                        seen_event_ids.add(event["event_id"])
+                    if catchup_events:
+                        logger.info(
+                            "Catch-up: %d transaksi dalam %ss dikirim ke Telegram.",
+                            len(catchup_events),
+                            MONITOR_CATCHUP_SECONDS,
+                        )
+
+                # Event yang lebih lama dari window catch-up juga dianggap lama,
+                # sehingga tidak tiba-tiba dikirim sebagai transaksi baru.
+                current_ids = {
+                    event["event_id"]
+                    for event in events
+                    if event.get("event_id")
+                }
                 seen_event_ids.update(current_ids)
-                baseline_ready = True
-                logger.info("Baseline dibuat: %d event.", len(current_ids))
+                save_monitor_state()
+                state_file_exists = True
             else:
-                new_events = [event for event in events if (event.get("event_id") and event["event_id"] not in seen_event_ids and not event.get("aborted"))]
-                for event in new_events:
-                    seen_event_ids.add(event["event_id"])
+                new_events = [
+                    event
+                    for event in events
+                    if (
+                        event.get("event_id")
+                        and event["event_id"] not in seen_event_ids
+                        and not event.get("aborted")
+                    )
+                ]
+                # Kirim dari yang paling lama ke yang terbaru.
                 for event in reversed(new_events):
                     await send_event_notification(application, event)
+                    seen_event_ids.add(event["event_id"])
+                    save_monitor_state()
+
                 if len(seen_event_ids) > 5000:
-                    seen_event_ids.clear()
-                    seen_event_ids.update(current_ids)
+                    # Pertahankan ID yang masih terlihat di hasil API saat ini.
+                    current_ids = {
+                        event["event_id"]
+                        for event in events
+                        if event.get("event_id")
+                    }
+                    seen_event_ids.intersection_update(current_ids)
+                    save_monitor_state()
+
+            first_poll = False
         except asyncio.CancelledError:
             raise
         except Exception:
